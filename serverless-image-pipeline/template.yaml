@@ -1,0 +1,489 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless image processing pipeline (S3 -> SQS -> Lambda -> Step Functions -> S3 -> CloudFront)
+
+Parameters:
+  WatermarkText:
+    Type: String
+    Default: "(c) My Project"
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: Optional. Email address subscribed to job success/failure notifications.
+  EnableCloudFront:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Set to "false" if your AWS account is not yet verified for CloudFront.
+  MaxImageBytes:
+    Type: Number
+    Default: 5242880
+    Description: Maximum accepted upload size in bytes (default 5 MB).
+
+Conditions:
+  UseCloudFront: !Equals [!Ref EnableCloudFront, "true"]
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Tracing: Active
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref ImageTable
+
+Resources:
+  # ---------------------------------------------------------------- Buckets
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: IngestQueuePolicy
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-source-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT]
+            AllowedOrigins: ["*"]   # restrict to your front-end origin in production
+            AllowedHeaders: ["*"]
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: tier-and-expire-originals
+            Status: Enabled
+            Prefix: uploads/
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 90
+            ExpirationInDays: 365
+          - Id: abort-incomplete-multipart
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt IngestQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+
+  DestinationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-destination-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-work-files
+            Status: Enabled
+            Prefix: work/
+            ExpirationInDays: 1
+          - Id: tier-processed
+            Status: Enabled
+            Prefix: processed/
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 30
+          - Id: abort-incomplete-multipart
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  DestinationBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DestinationBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - !If
+            - UseCloudFront
+            - Sid: AllowCloudFrontReadProcessedOnly
+              Effect: Allow
+              Principal:
+                Service: cloudfront.amazonaws.com
+              Action: s3:GetObject
+              Resource: !Sub "${DestinationBucket.Arn}/processed/*"
+              Condition:
+                StringEquals:
+                  AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+            - !Ref AWS::NoValue
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt DestinationBucket.Arn
+              - !Sub "${DestinationBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ------------------------------------------------------------ Queue + DLQ
+  IngestDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600   # 14 days to investigate failures
+      SqsManagedSseEnabled: true
+
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180            # >= 6x the consumer function timeout (30s)
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngestDLQ.Arn
+        maxReceiveCount: 3
+
+  IngestQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref IngestQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3SendMessage
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt IngestQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-source-${AWS::AccountId}-${AWS::Region}"
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # --------------------------------------------------------------- DynamoDB
+  ImageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: imageId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: imageId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # -------------------------------------------------------------------- SNS
+  JobTopic:
+    Type: AWS::SNS::Topic
+
+  JobEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref JobTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ----------------------------------------------------------------- Layer
+  ImageLibsLayer:
+    Type: AWS::Serverless::LayerVersion
+    Metadata:
+      BuildMethod: python3.12
+    Properties:
+      LayerName: !Sub "${AWS::StackName}-image-libs"
+      Description: Pillow for image processing
+      ContentUri: layers/image-libs/
+      CompatibleRuntimes: [python3.12]
+      RetentionPolicy: Delete
+
+  # ------------------------------------------------------------- API + URLs
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: [content-type]
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 40
+        ThrottlingRateLimit: 20
+
+  PresignFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/presign/
+      Handler: app.handler
+      Description: Issues pre-signed S3 PUT URLs for uploads
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucket
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref SourceBucket
+        - DynamoDBWritePolicy:
+            TableName: !Ref ImageTable
+      Events:
+        UploadUrl:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /upload-url
+            Method: POST
+
+  UiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/ui/
+      Handler: app.handler
+      Description: Serves the public demo web page
+      MemorySize: 128
+      Events:
+        Home:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /
+            Method: GET
+
+  StatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/status/
+      Handler: app.handler
+      Description: Returns processing status and image URLs for the demo page
+      Environment:
+        Variables:
+          DEST_BUCKET: !Ref DestinationBucket
+          CDN_DOMAIN: !If [UseCloudFront, !GetAtt Distribution.DomainName, ""]
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ImageTable
+        - S3ReadPolicy:
+            BucketName: !Ref DestinationBucket
+      Events:
+        GetStatus:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /images/{imageId}
+            Method: GET
+
+  # ------------------------------------------------- SQS -> Step Functions
+  StartWorkflowFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/start_workflow/
+      Handler: app.handler
+      Description: Consumes S3 events from SQS and starts one workflow per image
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref ImageStateMachine
+      Policies:
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt ImageStateMachine.Name
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IngestQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  # -------------------------------------------------------- Workflow steps
+  ValidateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/validate/
+      Handler: app.handler
+      MemorySize: 512
+      Layers: [!Ref ImageLibsLayer]
+      Environment:
+        Variables:
+          MAX_IMAGE_BYTES: !Ref MaxImageBytes
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SourceBucket
+        - DynamoDBWritePolicy:
+            TableName: !Ref ImageTable
+
+  ResizeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/resize/
+      Handler: app.handler
+      MemorySize: 1024
+      Timeout: 60
+      Layers: [!Ref ImageLibsLayer]
+      Environment:
+        Variables:
+          DEST_BUCKET: !Ref DestinationBucket
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SourceBucket
+        - S3WritePolicy:
+            BucketName: !Ref DestinationBucket
+
+  WatermarkFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/watermark/
+      Handler: app.handler
+      MemorySize: 1024
+      Timeout: 60
+      Layers: [!Ref ImageLibsLayer]
+      Environment:
+        Variables:
+          DEST_BUCKET: !Ref DestinationBucket
+          WATERMARK_TEXT: !Ref WatermarkText
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref DestinationBucket
+
+  StoreFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/store/
+      Handler: app.handler
+      Environment:
+        Variables:
+          DEST_BUCKET: !Ref DestinationBucket
+          CDN_DOMAIN: !If [UseCloudFront, !GetAtt Distribution.DomainName, ""]
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref DestinationBucket
+        - DynamoDBWritePolicy:
+            TableName: !Ref ImageTable
+
+  ImageStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Type: STANDARD
+      DefinitionUri: statemachine/definition.asl.json
+      DefinitionSubstitutions:
+        ValidateFunctionArn: !GetAtt ValidateFunction.Arn
+        ResizeFunctionArn: !GetAtt ResizeFunction.Arn
+        WatermarkFunctionArn: !GetAtt WatermarkFunction.Arn
+        StoreFunctionArn: !GetAtt StoreFunction.Arn
+        TableName: !Ref ImageTable
+        TopicArn: !Ref JobTopic
+      Tracing:
+        Enabled: true
+      Logging:
+        Level: ERROR
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ValidateFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ResizeFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref WatermarkFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref StoreFunction
+        - DynamoDBWritePolicy:
+            TableName: !Ref ImageTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt JobTopic.TopicName
+        - Version: "2012-10-17"
+          Statement:
+            # Required by Step Functions to deliver logs to CloudWatch Logs
+            - Effect: Allow
+              Action:
+                - logs:CreateLogDelivery
+                - logs:GetLogDelivery
+                - logs:UpdateLogDelivery
+                - logs:DeleteLogDelivery
+                - logs:ListLogDeliveries
+                - logs:PutResourcePolicy
+                - logs:DescribeResourcePolicies
+                - logs:DescribeLogGroups
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
+                - xray:GetSamplingRules
+                - xray:GetSamplingTargets
+              Resource: "*"
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+
+  # ------------------------------------------------------------ CloudFront
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Condition: UseCloudFront
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: UseCloudFront
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: processed-images
+            DomainName: !GetAtt DestinationBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+        DefaultCacheBehavior:
+          TargetOriginId: processed-images
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # Managed-CachingOptimized
+
+Outputs:
+  DemoUrl:
+    Description: Open this in a browser to try the pipeline
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/"
+  UploadUrlEndpoint:
+    Description: 'POST here with a JSON body containing filename and contentType'
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/upload-url"
+  CloudFrontDomain:
+    Condition: UseCloudFront
+    Value: !GetAtt Distribution.DomainName
+  SourceBucketName:
+    Value: !Ref SourceBucket
+  DestinationBucketName:
+    Value: !Ref DestinationBucket
+  StateMachineArn:
+    Value: !Ref ImageStateMachine
+  MetadataTableName:
+    Value: !Ref ImageTable
+  DeadLetterQueueUrl:
+    Value: !Ref IngestDLQ

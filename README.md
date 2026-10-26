@@ -12,7 +12,7 @@ Open the link, choose a JPEG, PNG or WebP image (up to 5 MB), and the page uploa
 
 ## Architecture
 
-![Solution architecture](docs/architecture.png)
+![Solution architecture](serverless-image-pipeline/docs/architecture.png)
 
 **Flow**
 
@@ -126,11 +126,11 @@ An uploaded JPEG produced both variants within a second of each other:
 2026-10-24 10:11:01       5382 processed/009f50e1-682b-49e2-bd17-2027aa674061/thumbnail.webp
 ```
 
-![Step Functions execution](docs/screenshots/stepfunctions-success.png)
-![Processed objects in S3](docs/screenshots/s3-processed.png)
-![DynamoDB record](docs/screenshots/dynamodb-item.png)
+![Step Functions execution](serverless-image-pipeline/docs/screenshots/stepfunctions-success.png)
+![Processed objects in S3](serverless-image-pipeline/docs/screenshots/s3-processed.png)
+![DynamoDB record](serverless-image-pipeline/docs/screenshots/dynamodb-item.png)
 
-> Add your screenshots to `docs/screenshots/` using these file names.
+> Add your screenshots to `serverless-image-pipeline/docs/screenshots/` using these file names.
 
 ## Failure handling
 
